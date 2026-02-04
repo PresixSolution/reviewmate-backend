@@ -51,19 +51,21 @@ app.get('/', (req, res) => {
     res.send('ReviewMate Backend is Live! 🚀');
 });
 
-// 2. Google Login Link
+// 2. Google Login Link (Updated Fix)
 app.get('/auth/google', (req, res) => {
     const scopes = [
-        'https://www.googleapis.com/auth/business.manage', // GMB Access
+        'https://www.googleapis.com/auth/business.manage',
         'https://www.googleapis.com/auth/userinfo.email',
         'https://www.googleapis.com/auth/userinfo.profile'
     ];
     const url = oauth2Client.generateAuthUrl({
-        access_type: 'offline', // Important for Refresh Token
+        access_type: 'offline',
         scope: scopes,
         prompt: 'consent'
     });
-    res.json({ url });
+    
+    // Yahan hum JSON nahi, direct bhejenge
+    res.redirect(url); 
 });
 
 // 3. Google Callback (Login Success)
