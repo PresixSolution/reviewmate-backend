@@ -86,9 +86,13 @@ app.get('/auth/google/callback', async (req, res) => {
         
         await user.save();
 
-        // ✅ Correct Line (With Slash / before ?)
-        res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
+        / Redirect with Info
+        res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
 
+
+88 line me ye h 
+
+login karke dekh liya same error 
     } catch (error) {
         res.status(500).send("Login Failed");
     }
