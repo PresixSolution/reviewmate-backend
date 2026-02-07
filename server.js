@@ -86,8 +86,8 @@ app.get('/auth/google/callback', async (req, res) => {
         
         await user.save();
 
-        // Redirect with Info
-        res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
+        // Slash added before the '?' 
+res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
 
     } catch (error) {
         res.status(500).send("Login Failed");
