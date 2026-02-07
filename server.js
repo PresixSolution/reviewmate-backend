@@ -2,216 +2,238 @@
 require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
-const cors = require("cors");
 const cookieSession = require("cookie-session");
+const passport = require("passport");
 const { google } = require("googleapis");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
-
-/* ---------------- BASIC SETUP ---------------- */
 app.use(express.json());
-app.use(
-  cors({
-    origin: process.env.WP_FRONTEND_URL,
-    credentials: true,
-  })
-);
 
+/* -------------------- SESSION -------------------- */
 app.use(
   cookieSession({
     name: "reviewmate-session",
-    keys: [process.env.COOKIE_KEY],
+    keys: [process.env.SESSION_SECRET],
     maxAge: 24 * 60 * 60 * 1000,
   })
 );
 
-/* ---------------- DB ---------------- */
+app.use(passport.initialize());
+app.use(passport.session());
+
+/* -------------------- DB -------------------- */
 mongoose.connect(process.env.MONGO_URI);
 
-const UserSchema = new mongoose.Schema({
+/* -------------------- USER SCHEMA -------------------- */
+const automationSchema = new mongoose.Schema({
+  locationId: String,
+  timeFilter: {
+    type: String,
+    enum: ["7days", "14days", "30days", "all"],
+    default: "7days",
+  },
+  replyScope: {
+    type: String,
+    enum: ["unreplied_only", "rewrite_all"],
+    default: "unreplied_only",
+  },
+  tone: { type: String, default: "polite and professional" },
+  isEnabled: { type: Boolean, default: false },
+});
+
+const userSchema = new mongoose.Schema({
   googleId: String,
-  email: String,
   name: String,
   picture: String,
+  email: String,
   accessToken: String,
   refreshToken: String,
-  automationSettings: [
-    {
-      locationName: String,
-      locationId: String,
-      isEnabled: Boolean,
-      tone: String,
-      keywords: String,
-      timeFilter: String,
-      replyScope: String,
-    },
-  ],
+  tokens: { type: Number, default: 1000 },
+  automationSettings: [automationSchema],
 });
 
-const User = mongoose.model("User", UserSchema);
+const User = mongoose.model("User", userSchema);
 
-/* ---------------- GOOGLE AUTH ---------------- */
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  `${process.env.BACKEND_URL}/auth/google/callback`
+/* -------------------- PASSPORT -------------------- */
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser(async (id, done) => {
+  const user = await User.findById(id);
+  done(null, user);
+});
+
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: "/auth/google/callback", // ❗ DO NOT CHANGE
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      let user = await User.findOne({ googleId: profile.id });
+
+      if (!user) {
+        user = await User.create({
+          googleId: profile.id,
+          name: profile.displayName,
+          picture: profile.photos[0].value,
+          email: profile.emails[0].value,
+          accessToken,
+          refreshToken,
+        });
+      } else {
+        user.accessToken = accessToken;
+        user.refreshToken = refreshToken;
+        await user.save();
+      }
+      done(null, user);
+    }
+  )
 );
 
-const SCOPES = [
-  "https://www.googleapis.com/auth/business.manage",
-  "https://www.googleapis.com/auth/userinfo.profile",
-  "https://www.googleapis.com/auth/userinfo.email",
-];
-
-app.get("/auth/google", (req, res) => {
-  const url = oauth2Client.generateAuthUrl({
-    access_type: "offline",
+/* -------------------- AUTH ROUTES -------------------- */
+app.get(
+  "/auth/google",
+  passport.authenticate("google", {
+    scope: [
+      "https://www.googleapis.com/auth/business.manage",
+      "profile",
+      "email",
+    ],
+    accessType: "offline",
     prompt: "consent",
-    scope: SCOPES,
-  });
-  res.redirect(url);
-});
+  })
+);
 
-app.get("/auth/google/callback", async (req, res) => {
-  try {
-    const { tokens } = await oauth2Client.getToken(req.query.code);
-    oauth2Client.setCredentials(tokens);
-
-    const oauth2 = google.oauth2("v2");
-    const { data } = await oauth2.userinfo.get({ auth: oauth2Client });
-
-    let user = await User.findOne({ googleId: data.id });
-
-    if (!user) {
-      user = await User.create({
-        googleId: data.id,
-        email: data.email,
-        name: data.name,
-        picture: data.picture,
-        accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token,
-      });
-    } else {
-      user.accessToken = tokens.access_token;
-      if (tokens.refresh_token) user.refreshToken = tokens.refresh_token;
-      await user.save();
-    }
-
+app.get(
+  "/auth/google/callback",
+  passport.authenticate("google", { failureRedirect: "/" }),
+  (req, res) => {
+    // ❗ DO NOT CHANGE
     res.redirect(
-      `${process.env.WP_FRONTEND_URL}?uid=${user.googleId}&name=${encodeURIComponent(
-        user.name
-      )}&pic=${encodeURIComponent(user.picture)}`
+      `https://picxomaster.in/reviewmate/?uid=${req.user._id}`
     );
-  } catch (err) {
-    res.send("Authentication Failed");
   }
-});
+);
 
-/* ---------------- TOKEN REFRESH ---------------- */
-async function getAuthClient(user) {
+/* -------------------- GOOGLE CLIENT -------------------- */
+function getGoogleClient(user) {
+  const oauth2Client = new google.auth.OAuth2();
   oauth2Client.setCredentials({
     access_token: user.accessToken,
     refresh_token: user.refreshToken,
   });
-
-  oauth2Client.on("tokens", (tokens) => {
-    if (tokens.access_token) user.accessToken = tokens.access_token;
-    if (tokens.refresh_token) user.refreshToken = tokens.refresh_token;
-    user.save();
-  });
-
   return oauth2Client;
 }
 
-/* ---------------- FETCH LOCATIONS ---------------- */
+/* -------------------- FETCH LOCATIONS -------------------- */
 app.get("/api/locations", async (req, res) => {
-  try {
-    const user = await User.findOne({ googleId: req.query.googleId });
-    if (!user) return res.status(401).json({ error: "User not found" });
+  const user = await User.findById(req.query.uid);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-    const auth = await getAuthClient(user);
-    const mybusiness = google.mybusinessbusinessinformation({ version: "v1", auth });
+  const auth = getGoogleClient(user);
+  const myBusiness = google.mybusinessbusinessinformation({
+    version: "v1",
+    auth,
+  });
 
-    const accounts = await mybusiness.accounts.list();
-    const locations = [];
+  const locations = await myBusiness.accounts.locations.list({
+    parent: "accounts/-",
+  });
 
-    for (const acc of accounts.data.accounts || []) {
-      const locRes = await mybusiness.accounts.locations.list({
-        parent: acc.name,
-        readMask: "name,title",
-      });
-      locations.push(...(locRes.data.locations || []));
-    }
-
-    res.json(locations);
-  } catch (e) {
-    if (e.code === 401) return res.json({ error: "Invalid credentials" });
-    if (e.code === 429) return res.json({ error: "Quota exceeded. Wait 2 mins." });
-    res.status(500).json({ error: "Server error" });
-  }
+  res.json(locations.data.locations || []);
 });
 
-/* ---------------- SAVE & RUN ---------------- */
-app.post("/api/save-and-run", async (req, res) => {
-  const { googleId, settings } = req.body;
-  const user = await User.findOne({ googleId });
-  user.automationSettings = settings;
-  await user.save();
+/* -------------------- AI -------------------- */
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-  const report = await runAutomation(user);
-  res.json(report);
-});
+/* -------------------- AUTOMATION CORE -------------------- */
+async function runAutomation(user, log = console.log) {
+  const auth = getGoogleClient(user);
+  const myBusinessReviews = google.mybusinessreviews({
+    version: "v1",
+    auth,
+  });
 
-/* ---------------- CRON ---------------- */
-app.get("/api/global-cron-run", async (req, res) => {
-  const users = await User.find({});
-  for (const user of users) {
-    if (user.automationSettings?.length) {
-      await runAutomation(user);
-    }
-  }
-  res.send("Cron Completed");
-});
+  for (const setting of user.automationSettings) {
+    if (!setting.isEnabled) continue;
 
-/* ---------------- AUTOMATION BRAIN ---------------- */
-async function runAutomation(user) {
-  const auth = await getAuthClient(user);
-  const reviewsApi = google.mybusinessreviews({ version: "v1", auth });
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({ model: "gemini-pro" });
-
-  const logs = [];
-
-  for (const loc of user.automationSettings.filter((l) => l.isEnabled)) {
-    const reviews = await reviewsApi.accounts.locations.reviews.list({
-      parent: loc.locationId,
+    const reviewsRes = await myBusinessReviews.accounts.locations.reviews.list({
+      parent: setting.locationId,
     });
 
-    for (const review of reviews.data.reviews || []) {
-      if (loc.replyScope === "Unreplied Only" && review.reviewReply) continue;
+    const reviews = reviewsRes.data.reviews || [];
+    const now = Date.now();
+
+    for (const review of reviews) {
+      const created = new Date(review.createTime).getTime();
+      const daysOld = (now - created) / (1000 * 60 * 60 * 24);
+
+      /* ---- TIME FILTER ---- */
+      if (
+        setting.timeFilter !== "all" &&
+        daysOld > parseInt(setting.timeFilter)
+      ) {
+        log("Skipped old review");
+        continue;
+      }
+
+      /* ---- SCOPE FILTER ---- */
+      if (
+        setting.replyScope === "unreplied_only" &&
+        review.reviewReply
+      ) {
+        log("Skipped replied review");
+        continue;
+      }
+
+      /* ---- AI REPLY ---- */
+      const model = genAI.getGenerativeModel({ model: "gemini-pro" });
 
       const prompt = `
-Reply to this Google review politely.
-Tone: ${loc.tone}
-Keywords: ${loc.keywords}
-Review: "${review.comment}"
-`;
+Reply to this Google review in a ${setting.tone} tone:
 
-      const ai = await model.generateContent(prompt);
-      const reply = ai.response.text();
+"${review.comment}"
+      `;
 
-      await reviewsApi.accounts.locations.reviews.updateReply({
+      const result = await model.generateContent(prompt);
+      const reply = result.response.text();
+
+      await myBusinessReviews.accounts.locations.reviews.updateReply({
         name: review.name,
         requestBody: { comment: reply },
       });
 
-      logs.push(`Replied to ${review.reviewer.displayName}`);
+      log(`Replied to review by ${review.reviewer.displayName}`);
     }
   }
-
-  return logs;
 }
 
-/* ---------------- START ---------------- */
-app.listen(5000, () => console.log("ReviewMate Backend Running"));
+/* -------------------- SAVE & RUN -------------------- */
+app.post("/api/save-and-run", async (req, res) => {
+  const { uid, settings } = req.body;
+  const user = await User.findById(uid);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  user.automationSettings = settings;
+  await user.save();
+
+  runAutomation(user);
+  res.json({ success: true });
+});
+
+/* -------------------- CRON -------------------- */
+app.get("/api/global-cron-run", async (req, res) => {
+  const users = await User.find({ "automationSettings.isEnabled": true });
+  for (const user of users) {
+    await runAutomation(user);
+  }
+  res.json({ status: "Automation completed" });
+});
+
+/* -------------------- SERVER -------------------- */
+app.listen(5000, () =>
+  console.log("ReviewMate backend running on port 5000")
+);
