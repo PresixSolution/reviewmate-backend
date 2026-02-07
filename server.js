@@ -86,8 +86,8 @@ app.get('/auth/google/callback', async (req, res) => {
         
         await user.save();
 
-        // Slash added before the '?' 
-res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
+        // ✅ Correct Line (With Slash / before ?)
+        res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
 
     } catch (error) {
         res.status(500).send("Login Failed");
