@@ -125,31 +125,79 @@ app.post('/api/generate-reviews', async (req, res) => {
     }
 });
 
+// --- UPDATED API: Crash Proof Locations Fetch ---
 app.get('/api/locations', async (req, res) => {
     const { googleId } = req.query; 
-    try {
-        const user = await User.findOne({ googleId });
-        if (!user) return res.status(401).json({ error: "User not found" });
+    console.log(`📡 Fetching locations for User ID: ${googleId}`);
 
-        oauth2Client.setCredentials({ access_token: user.accessToken, refresh_token: user.refreshToken });
+    try {
+        // 1. User Check
+        const user = await User.findOne({ googleId });
+        if (!user) {
+            console.error("❌ User not found in DB");
+            return res.status(401).json({ error: "User not found. Please Login again." });
+        }
+
+        // 2. Auth Setup
+        oauth2Client.setCredentials({
+            access_token: user.accessToken,
+            refresh_token: user.refreshToken
+        });
+
+        // 3. Google API Call (Account Management)
+        console.log("🔄 Calling Google Account Management API...");
         const accountClient = google.mybusinessaccountmanagement('v1');
+        
+        // Yahan Error 500 aata hai agar API Enable na ho
         const accounts = await accountClient.accounts.list({ auth: oauth2Client });
         
+        console.log("✅ Accounts API Response Recieved");
+
+        if (!accounts.data || !accounts.data.accounts) {
+             console.error("⚠️ No accounts found in Google response.");
+             return res.json({ success: true, locations: [], message: "No Business Accounts found linked to this email." });
+        }
+
         let allLocations = [];
         const businessClient = google.mybusinessbusinessinformation('v1');
 
-        if (accounts.data.accounts) {
-            for (const account of accounts.data.accounts) {
-                const locs = await businessClient.accounts.locations.list({ parent: account.name, readMask: 'name,title,storeCode' });
-                if (locs.data.locations) allLocations.push(...locs.data.locations);
+        // 4. Loop through accounts
+        for (const account of accounts.data.accounts) {
+            console.log(`🔎 Checking locations for account: ${account.name}`);
+            
+            try {
+                const locs = await businessClient.accounts.locations.list({ 
+                    parent: account.name, 
+                    readMask: 'name,title,storeCode',
+                    pageSize: 100
+                });
+
+                if (locs.data.locations) {
+                    allLocations.push(...locs.data.locations);
+                }
+            } catch (innerError) {
+                console.error(`⚠️ Error fetching locations for ${account.name}:`, innerError.message);
+                // Agar ek account fail ho, to baki check karo (Crash mat karo)
             }
         }
+
+        console.log(`🎉 Total Locations Found: ${allLocations.length}`);
         res.json({ success: true, locations: allLocations });
+
     } catch (error) {
-        res.status(500).json({ error: "Failed to fetch locations" });
+        console.error("💥 CRITICAL SERVER ERROR:", error);
+        
+        // Agar Google API Enable nahi hai, to ye 403 error aayega
+        if (error.code === 403) {
+            return res.status(500).json({ 
+                error: "Google API Error (403): Please ENABLE 'Google My Business Account Management API' in Cloud Console.",
+                details: error.message
+            });
+        }
+
+        res.status(500).json({ error: "Server Error: " + error.message });
     }
 });
-
 app.post('/api/process-automation', async (req, res) => {
     const { googleId, selectedLocations } = req.body;
     try {
