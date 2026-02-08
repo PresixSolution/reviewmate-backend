@@ -1,324 +1,234 @@
-// server.js
-require("dotenv").config();
-const express = require("express");
-const mongoose = require("mongoose");
-const cookieSession = require("cookie-session");
-const passport = require("passport");
-const { google } = require("googleapis");
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const { google } = require('googleapis');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const cookieSession = require('cookie-session');
 
 const app = express();
+app.use(cors({ origin: true, credentials: true })); 
 app.use(express.json());
+app.use(cookieSession({
+    name: 'session',
+    keys: [process.env.SESSION_SECRET || 'secret'],
+    maxAge: 30 * 24 * 60 * 60 * 1000 // 30 Days
+}));
 
-/* -------------------- SESSION -------------------- */
-app.use(
-  cookieSession({
-    name: "reviewmate-session",
-    keys: [process.env.SESSION_SECRET],
-    maxAge: 24 * 60 * 60 * 1000,
-  })
+// --- CONFIG ---
+const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.REDIRECT_URI 
 );
 
-app.use(passport.initialize());
-app.use(passport.session());
-
-/* -------------------- DB -------------------- */
-mongoose.connect(process.env.MONGO_URI);
-
-/* -------------------- USER SCHEMA -------------------- */
-const automationSchema = new mongoose.Schema({
-  locationId: { type: String, required: true },
-  timeFilter: {
-    type: String,
-    enum: ["7days", "14days", "30days", "all"],
-    default: "7days",
-  },
-  replyScope: {
-    type: String,
-    enum: ["unreplied_only", "rewrite_all"],
-    default: "unreplied_only",
-  },
-  tone: { type: String, default: "polite and professional" },
-  isEnabled: { type: Boolean, default: false },
-});
-
-const userSchema = new mongoose.Schema({
-  googleId: String,
-  name: String,
-  picture: String,
-  email: String,
-  accessToken: String,
-  refreshToken: String,
-  tokens: { type: Number, default: 1000 },
-  automationSettings: [automationSchema],
-});
-
-const User = mongoose.model("User", userSchema);
-
-/* -------------------- PASSPORT -------------------- */
-const GoogleStrategy = require("passport-google-oauth20").Strategy;
-
-passport.serializeUser((user, done) => done(null, user.id));
-passport.deserializeUser(async (id, done) => {
-  const user = await User.findById(id);
-  done(null, user);
-});
-
-passport.use(
-  new GoogleStrategy(
-    {
-      clientID: process.env.GOOGLE_CLIENT_ID,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: "/auth/google/callback", // ❗ DO NOT CHANGE
-    },
-    async (accessToken, refreshToken, profile, done) => {
-      let user = await User.findOne({ googleId: profile.id });
-
-      if (!user) {
-        user = await User.create({
-          googleId: profile.id,
-          name: profile.displayName,
-          picture: profile.photos[0].value,
-          email: profile.emails[0].value,
-          accessToken,
-          refreshToken,
-        });
-      } else {
-        user.accessToken = accessToken;
-        user.refreshToken = refreshToken;
-        user.name = profile.displayName;
-        user.picture = profile.photos[0].value;
-        user.email = profile.emails[0].value;
-        await user.save();
-      }
-      done(null, user);
-    }
-  )
-);
-
-/* -------------------- AUTH ROUTES -------------------- */
-app.get(
-  "/auth/google",
-  passport.authenticate("google", {
-    scope: [
-      "https://www.googleapis.com/auth/business.manage",
-      "profile",
-      "email",
-    ],
-    accessType: "offline",
-    prompt: "consent",
-  })
-);
-
-app.get(
-  "/auth/google/callback",
-  passport.authenticate("google", { failureRedirect: "/" }),
-  (req, res) => {
-    // ❗ DO NOT CHANGE
-    res.redirect(`https://picxomaster.in/reviewmate/?uid=${req.user._id}`);
-  }
-);
-
-/* -------------------- GOOGLE CLIENT -------------------- */
-function getGoogleClient(user) {
-  const oauth2Client = new google.auth.OAuth2();
-  oauth2Client.setCredentials({
-    access_token: user.accessToken,
-    refresh_token: user.refreshToken,
-  });
-  return oauth2Client;
-}
-
-function buildDefaultSetting(locationId) {
-  return {
-    locationId,
-    timeFilter: "7days",
-    replyScope: "unreplied_only",
-    tone: "polite and professional",
-    isEnabled: false,
-  };
-}
-
-function normalizeSettings(settings) {
-  const allowedTime = new Set(["7days", "14days", "30days", "all"]);
-  const allowedScope = new Set(["unreplied_only", "rewrite_all"]);
-
-  return (settings || [])
-    .filter((setting) => setting && setting.locationId)
-    .map((setting) => ({
-      locationId: setting.locationId,
-      timeFilter: allowedTime.has(setting.timeFilter)
-        ? setting.timeFilter
-        : "7days",
-      replyScope: allowedScope.has(setting.replyScope)
-        ? setting.replyScope
-        : "unreplied_only",
-      tone:
-        typeof setting.tone === "string" && setting.tone.trim()
-          ? setting.tone.trim()
-          : "polite and professional",
-      isEnabled: Boolean(setting.isEnabled),
-    }));
-}
-
-/* -------------------- FETCH LOCATIONS -------------------- */
-app.get("/api/locations", async (req, res) => {
-  const user = await User.findById(req.query.uid);
-  if (!user) return res.status(401).json({ error: "Unauthorized" });
-
-  const auth = getGoogleClient(user);
-  const myBusiness = google.mybusinessbusinessinformation({
-    version: "v1",
-    auth,
-  });
-
-  const locationsResponse = await myBusiness.accounts.locations.list({
-    parent: "accounts/-",
-  });
-
-  const settingsByLocation = new Map(
-    (user.automationSettings || []).map((setting) => [
-      setting.locationId,
-      setting,
-    ])
-  );
-
-  const locations = (locationsResponse.data.locations || []).map((location) => {
-    const existingSetting = settingsByLocation.get(location.name);
-    return {
-      ...location,
-      automationSetting: existingSetting
-        ? {
-            locationId: existingSetting.locationId,
-            timeFilter: existingSetting.timeFilter,
-            replyScope: existingSetting.replyScope,
-            tone: existingSetting.tone,
-            isEnabled: existingSetting.isEnabled,
-          }
-        : buildDefaultSetting(location.name),
-    };
-  });
-
-  res.json(locations);
-});
-
-app.get("/api/me", async (req, res) => {
-  const user = await User.findById(req.query.uid);
-  if (!user) return res.status(401).json({ error: "Unauthorized" });
-
-  res.json({
-    id: user._id,
-    name: user.name,
-    picture: user.picture,
-    email: user.email,
-  });
-});
-
-/* -------------------- AI -------------------- */
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-function getCutoffDate(timeFilter) {
-  if (timeFilter === "all") return null;
-  const days = Number.parseInt(timeFilter.replace("days", ""), 10);
-  if (Number.isNaN(days)) return null;
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - days);
-  return cutoff;
-}
+// Database Connection
+mongoose.connect(process.env.MONGO_URI)
+    .then(() => console.log("✅ DB Connected"))
+    .catch(err => console.error("❌ DB Error:", err));
 
-function buildPrompt({ tone, review }) {
-  const reviewer = review.reviewer?.displayName || "the customer";
-  const rating = review.starRating || "";
-  const comment = review.comment || "";
+// --- UPDATED SCHEMA (With Smart Settings) ---
+const UserSchema = new mongoose.Schema({
+    googleId: String,
+    email: String,
+    name: String,
+    picture: String,
+    accessToken: String,
+    refreshToken: String,
+    automationSettings: [{
+        name: String, // Location ID
+        title: String, // Business Name
+        tone: String,
+        keywords: String,
+        isEnabled: Boolean,
+        timeFilter: String, // '7days', '14days', '30days', 'all'
+        replyScope: String  // 'unreplied_only', 'rewrite_all'
+    }]
+});
+const User = mongoose.model('User', UserSchema);
 
-  return `You are responding to a Google review in a ${tone} tone.
+// --- ROUTES ---
+app.get('/', (req, res) => res.send('ReviewMate Smart Backend Live 🚀'));
 
-Review details:
-Reviewer: ${reviewer}
-Rating: ${rating}
-Comment: "${comment}"
-
-Write a concise, friendly reply that thanks them and addresses their feedback. Do not mention automation.`;
-}
-
-/* -------------------- AUTOMATION CORE -------------------- */
-async function runAutomation(user, log = console.log) {
-  const auth = getGoogleClient(user);
-  const myBusinessReviews = google.mybusinessreviews({
-    version: "v1",
-    auth,
-  });
-
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-  for (const setting of user.automationSettings || []) {
-    if (!setting.isEnabled) continue;
-
-    const reviewsRes = await myBusinessReviews.accounts.locations.reviews.list({
-      parent: setting.locationId,
+// 1. LOGIN (Manual OAuth - No Passport needed)
+app.get('/auth/google', (req, res) => {
+    const url = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        scope: [
+            'https://www.googleapis.com/auth/business.manage',
+            'https://www.googleapis.com/auth/userinfo.profile',
+            'https://www.googleapis.com/auth/userinfo.email'
+        ],
+        prompt: 'consent'
     });
+    res.redirect(url);
+});
 
-    const reviews = reviewsRes.data.reviews || [];
-    const cutoffDate = getCutoffDate(setting.timeFilter);
+// 2. CALLBACK (Handshake)
+app.get('/auth/google/callback', async (req, res) => {
+    const { code } = req.query;
+    try {
+        const { tokens } = await oauth2Client.getToken(code);
+        oauth2Client.setCredentials(tokens);
+        
+        const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+        const userInfo = await oauth2.userinfo.get();
 
-    for (const review of reviews) {
-      const createdTime = review.createTime ? new Date(review.createTime) : null;
-      if (cutoffDate && createdTime && createdTime < cutoffDate) {
-        log(`Skipped old review for ${setting.locationId}`);
-        continue;
-      }
+        let user = await User.findOne({ googleId: userInfo.data.id });
+        if (!user) {
+            user = new User({ googleId: userInfo.data.id, email: userInfo.data.email });
+        }
+        
+        // Save Tokens & Profile
+        user.accessToken = tokens.access_token;
+        if(tokens.refresh_token) user.refreshToken = tokens.refresh_token;
+        user.name = userInfo.data.name;
+        user.picture = userInfo.data.picture;
+        
+        await user.save();
 
-      if (setting.replyScope === "unreplied_only" && review.reviewReply) {
-        log(`Skipped replied review for ${setting.locationId}`);
-        continue;
-      }
+        // Redirect to WordPress with Profile Data
+        // IMPORTANT: Make sure this link matches your WordPress Site exactly
+        res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
 
-      const prompt = buildPrompt({ tone: setting.tone, review });
-      const result = await model.generateContent(prompt);
-      const reply = result.response.text().trim();
-
-      if (!reply) {
-        log(`Skipped empty reply for ${setting.locationId}`);
-        continue;
-      }
-
-      await myBusinessReviews.accounts.locations.reviews.updateReply({
-        name: review.name,
-        requestBody: { comment: reply },
-      });
-
-      log(
-        `Replied to review by ${
-          review.reviewer?.displayName || "a customer"
-        } for ${setting.locationId}`
-      );
+    } catch (error) {
+        console.error("Login Error:", error);
+        res.status(500).send("Login Failed. Please try again.");
     }
-  }
+});
+
+// 3. GET LOCATIONS
+app.get('/api/locations', async (req, res) => {
+    const { googleId } = req.query; 
+    try {
+        const user = await User.findOne({ googleId });
+        if (!user) return res.status(401).json({ error: "User not found" });
+
+        oauth2Client.setCredentials({ access_token: user.accessToken, refresh_token: user.refreshToken });
+        const accountClient = google.mybusinessaccountmanagement('v1');
+        
+        // Fetch Accounts
+        const accounts = await accountClient.accounts.list({ auth: oauth2Client });
+        if (!accounts.data.accounts) return res.json({ success: true, locations: [] });
+
+        let allLocations = [];
+        const businessClient = google.mybusinessbusinessinformation('v1');
+
+        for (const account of accounts.data.accounts) {
+            try {
+                const locs = await businessClient.accounts.locations.list({ 
+                    parent: account.name, readMask: 'name,title', pageSize: 100 
+                });
+                if (locs.data.locations) allLocations.push(...locs.data.locations);
+            } catch (e) { console.error("Loc fetch error:", e.message); }
+        }
+        res.json({ success: true, locations: allLocations });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 4. SAVE SETTINGS & RUN AUTOMATION (The Smart Part)
+app.post('/api/save-and-run', async (req, res) => {
+    const { googleId, selectedLocations } = req.body;
+    try {
+        const user = await User.findOne({ googleId });
+        if (!user) return res.status(401).json({ error: "User not found" });
+
+        // Save new settings
+        user.automationSettings = selectedLocations;
+        await user.save();
+
+        // Trigger Automation
+        const report = await runAutomationForUser(user);
+        res.json({ success: true, report });
+
+    } catch (error) {
+        console.error("Automation Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 5. GLOBAL CRON (For Daily Auto-Run)
+app.get('/api/global-cron-run', async (req, res) => {
+    console.log("⏰ Global Cron Started...");
+    const users = await User.find({});
+    let count = 0;
+    for(const user of users) {
+        if(user.automationSettings && user.automationSettings.some(s => s.isEnabled)) {
+            await runAutomationForUser(user);
+            count++;
+        }
+    }
+    res.send(`✅ Automation Complete. Processed ${count} users.`);
+});
+
+// --- HELPER: SMART AUTOMATION LOGIC ---
+async function runAutomationForUser(user) {
+    oauth2Client.setCredentials({ access_token: user.accessToken, refresh_token: user.refreshToken });
+    const reviewClient = google.mybusinessreviews('v1');
+    let report = [];
+
+    for (const setting of user.automationSettings) {
+        if (!setting.isEnabled) continue;
+
+        try {
+            const reviews = await reviewClient.accounts.locations.reviews.list({
+                parent: setting.name,
+                pageSize: 20 // Check last 20 reviews
+            });
+
+            if (reviews.data.reviews) {
+                for (const review of reviews.data.reviews) {
+                    
+                    // --- A. TIME FILTER CHECK ---
+                    const reviewDate = new Date(review.createTime);
+                    const now = new Date();
+                    const daysDiff = (now - reviewDate) / (1000 * 60 * 60 * 24);
+                    
+                    let limit = 9999;
+                    if(setting.timeFilter === '7days') limit = 7;
+                    if(setting.timeFilter === '14days') limit = 14;
+                    if(setting.timeFilter === '30days') limit = 30;
+                    
+                    if(daysDiff > limit) continue; // Skip old reviews
+
+                    // --- B. SCOPE CHECK ---
+                    const hasReply = !!review.reviewReply;
+                    if (setting.replyScope === 'unreplied_only' && hasReply) continue; // Skip if replied
+
+                    // --- C. GENERATE REPLY ---
+                    const prompt = `Write a reply to this customer review: "${review.comment || 'Star Rating'}". 
+                    Business: ${setting.title}. Tone: ${setting.tone}. 
+                    ${setting.keywords ? 'Include keywords: '+setting.keywords : ''}. 
+                    Keep it professional and short.`;
+                    
+                    const aiResult = await model.generateContent(prompt);
+                    const replyText = aiResult.response.text();
+
+                    // --- D. POST REPLY ---
+                    await reviewClient.accounts.locations.reviews.updateReply({
+                        parent: review.name,
+                        requestBody: { comment: replyText }
+                    });
+
+                    report.push({ 
+                        business: setting.title, 
+                        reviewer: review.reviewer.displayName,
+                        action: "Replied",
+                        details: hasReply ? "Updated existing reply" : "New reply"
+                    });
+                }
+            }
+        } catch (e) {
+            console.error(`Error processing ${setting.title}:`, e.message);
+        }
+    }
+    return report;
 }
 
-/* -------------------- SAVE & RUN -------------------- */
-app.post("/api/save-and-run", async (req, res) => {
-  const { uid, settings } = req.body;
-  const user = await User.findById(uid);
-  if (!user) return res.status(401).json({ error: "Unauthorized" });
-
-  user.automationSettings = normalizeSettings(settings);
-  await user.save();
-
-  runAutomation(user);
-  res.json({ success: true });
-});
-
-/* -------------------- CRON -------------------- */
-app.get("/api/global-cron-run", async (req, res) => {
-  const users = await User.find({ "automationSettings.isEnabled": true });
-  for (const user of users) {
-    await runAutomation(user);
-  }
-  res.json({ status: "Automation completed" });
-});
-
-/* -------------------- SERVER -------------------- */
-app.listen(5000, () =>
-  console.log("ReviewMate backend running on port 5000")
-);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
