@@ -93,7 +93,6 @@ app.get('/auth/google/callback', async (req, res) => {
         // Redirect to WordPress with Profile Data
         // IMPORTANT: Make sure this link matches your WordPress Site exactly
         res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
-
     } catch (error) {
         console.error("Login Error:", error);
         res.status(500).send("Login Failed. Please try again.");
