@@ -67,7 +67,7 @@ app.get('/auth/google', (req, res) => {
     res.redirect(url);
 });
 
-// 2. CALLBACK (Handshake)
+// 2. CALLBACK (Handshake) - FIXED URL HERE ✅
 app.get('/auth/google/callback', async (req, res) => {
     const { code } = req.query;
     try {
@@ -90,9 +90,9 @@ app.get('/auth/google/callback', async (req, res) => {
         
         await user.save();
 
-        // Redirect to WordPress with Profile Data
-        // IMPORTANT: Make sure this link matches your WordPress Site exactly
+        // ✅ FIXED LINK: Correct Domain & Slash added
         res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
+
     } catch (error) {
         console.error("Login Error:", error);
         res.status(500).send("Login Failed. Please try again.");
