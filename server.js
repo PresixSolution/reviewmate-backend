@@ -27,7 +27,7 @@ mongoose.connect(process.env.MONGO_URI);
 
 /* -------------------- USER SCHEMA -------------------- */
 const automationSchema = new mongoose.Schema({
-  locationId: String,
+  locationId: { type: String, required: true },
   timeFilter: {
     type: String,
     enum: ["7days", "14days", "30days", "all"],
@@ -86,6 +86,9 @@ passport.use(
       } else {
         user.accessToken = accessToken;
         user.refreshToken = refreshToken;
+        user.name = profile.displayName;
+        user.picture = profile.photos[0].value;
+        user.email = profile.emails[0].value;
         await user.save();
       }
       done(null, user);
@@ -112,9 +115,7 @@ app.get(
   passport.authenticate("google", { failureRedirect: "/" }),
   (req, res) => {
     // ❗ DO NOT CHANGE
-    res.redirect(
-      `https://picxomaster.in/reviewmate/?uid=${req.user._id}`
-    );
+    res.redirect(`https://picxomaster.in/reviewmate/?uid=${req.user._id}`);
   }
 );
 
@@ -128,6 +129,38 @@ function getGoogleClient(user) {
   return oauth2Client;
 }
 
+function buildDefaultSetting(locationId) {
+  return {
+    locationId,
+    timeFilter: "7days",
+    replyScope: "unreplied_only",
+    tone: "polite and professional",
+    isEnabled: false,
+  };
+}
+
+function normalizeSettings(settings) {
+  const allowedTime = new Set(["7days", "14days", "30days", "all"]);
+  const allowedScope = new Set(["unreplied_only", "rewrite_all"]);
+
+  return (settings || [])
+    .filter((setting) => setting && setting.locationId)
+    .map((setting) => ({
+      locationId: setting.locationId,
+      timeFilter: allowedTime.has(setting.timeFilter)
+        ? setting.timeFilter
+        : "7days",
+      replyScope: allowedScope.has(setting.replyScope)
+        ? setting.replyScope
+        : "unreplied_only",
+      tone:
+        typeof setting.tone === "string" && setting.tone.trim()
+          ? setting.tone.trim()
+          : "polite and professional",
+      isEnabled: Boolean(setting.isEnabled),
+    }));
+}
+
 /* -------------------- FETCH LOCATIONS -------------------- */
 app.get("/api/locations", async (req, res) => {
   const user = await User.findById(req.query.uid);
@@ -139,15 +172,74 @@ app.get("/api/locations", async (req, res) => {
     auth,
   });
 
-  const locations = await myBusiness.accounts.locations.list({
+  const locationsResponse = await myBusiness.accounts.locations.list({
     parent: "accounts/-",
   });
 
-  res.json(locations.data.locations || []);
+  const settingsByLocation = new Map(
+    (user.automationSettings || []).map((setting) => [
+      setting.locationId,
+      setting,
+    ])
+  );
+
+  const locations = (locationsResponse.data.locations || []).map((location) => {
+    const existingSetting = settingsByLocation.get(location.name);
+    return {
+      ...location,
+      automationSetting: existingSetting
+        ? {
+            locationId: existingSetting.locationId,
+            timeFilter: existingSetting.timeFilter,
+            replyScope: existingSetting.replyScope,
+            tone: existingSetting.tone,
+            isEnabled: existingSetting.isEnabled,
+          }
+        : buildDefaultSetting(location.name),
+    };
+  });
+
+  res.json(locations);
+});
+
+app.get("/api/me", async (req, res) => {
+  const user = await User.findById(req.query.uid);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  res.json({
+    id: user._id,
+    name: user.name,
+    picture: user.picture,
+    email: user.email,
+  });
 });
 
 /* -------------------- AI -------------------- */
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+function getCutoffDate(timeFilter) {
+  if (timeFilter === "all") return null;
+  const days = Number.parseInt(timeFilter.replace("days", ""), 10);
+  if (Number.isNaN(days)) return null;
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  return cutoff;
+}
+
+function buildPrompt({ tone, review }) {
+  const reviewer = review.reviewer?.displayName || "the customer";
+  const rating = review.starRating || "";
+  const comment = review.comment || "";
+
+  return `You are responding to a Google review in a ${tone} tone.
+
+Review details:
+Reviewer: ${reviewer}
+Rating: ${rating}
+Comment: "${comment}"
+
+Write a concise, friendly reply that thanks them and addresses their feedback. Do not mention automation.`;
+}
 
 /* -------------------- AUTOMATION CORE -------------------- */
 async function runAutomation(user, log = console.log) {
@@ -157,7 +249,9 @@ async function runAutomation(user, log = console.log) {
     auth,
   });
 
-  for (const setting of user.automationSettings) {
+  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+  for (const setting of user.automationSettings || []) {
     if (!setting.isEnabled) continue;
 
     const reviewsRes = await myBusinessReviews.accounts.locations.reviews.list({
@@ -165,48 +259,39 @@ async function runAutomation(user, log = console.log) {
     });
 
     const reviews = reviewsRes.data.reviews || [];
-    const now = Date.now();
+    const cutoffDate = getCutoffDate(setting.timeFilter);
 
     for (const review of reviews) {
-      const created = new Date(review.createTime).getTime();
-      const daysOld = (now - created) / (1000 * 60 * 60 * 24);
-
-      /* ---- TIME FILTER ---- */
-      if (
-        setting.timeFilter !== "all" &&
-        daysOld > parseInt(setting.timeFilter)
-      ) {
-        log("Skipped old review");
+      const createdTime = review.createTime ? new Date(review.createTime) : null;
+      if (cutoffDate && createdTime && createdTime < cutoffDate) {
+        log(`Skipped old review for ${setting.locationId}`);
         continue;
       }
 
-      /* ---- SCOPE FILTER ---- */
-      if (
-        setting.replyScope === "unreplied_only" &&
-        review.reviewReply
-      ) {
-        log("Skipped replied review");
+      if (setting.replyScope === "unreplied_only" && review.reviewReply) {
+        log(`Skipped replied review for ${setting.locationId}`);
         continue;
       }
 
-      /* ---- AI REPLY ---- */
-      const model = genAI.getGenerativeModel({ model: "gemini-pro" });
-
-      const prompt = `
-Reply to this Google review in a ${setting.tone} tone:
-
-"${review.comment}"
-      `;
-
+      const prompt = buildPrompt({ tone: setting.tone, review });
       const result = await model.generateContent(prompt);
-      const reply = result.response.text();
+      const reply = result.response.text().trim();
+
+      if (!reply) {
+        log(`Skipped empty reply for ${setting.locationId}`);
+        continue;
+      }
 
       await myBusinessReviews.accounts.locations.reviews.updateReply({
         name: review.name,
         requestBody: { comment: reply },
       });
 
-      log(`Replied to review by ${review.reviewer.displayName}`);
+      log(
+        `Replied to review by ${
+          review.reviewer?.displayName || "a customer"
+        } for ${setting.locationId}`
+      );
     }
   }
 }
@@ -217,7 +302,7 @@ app.post("/api/save-and-run", async (req, res) => {
   const user = await User.findById(uid);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  user.automationSettings = settings;
+  user.automationSettings = normalizeSettings(settings);
   await user.save();
 
   runAutomation(user);
