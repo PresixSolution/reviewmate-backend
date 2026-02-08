@@ -91,7 +91,7 @@ app.get('/auth/google/callback', async (req, res) => {
         await user.save();
 
         // ✅ FIXED LINK: Correct Domain & Slash added
-        res.redirect(`https://picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
+        res.redirect(`https://www..picxomaster.in/reviewmate/?uid=${user.googleId}&name=${encodeURIComponent(user.name)}&pic=${encodeURIComponent(user.picture)}`);
 
     } catch (error) {
         console.error("Login Error:", error);
